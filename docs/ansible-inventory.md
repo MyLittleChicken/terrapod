@@ -252,13 +252,11 @@ data "aws_instance" "app" {
 }
 
 resource "terrapod_inventory_group" "app" {
-  workspace_id = var.workspace_id
-  name         = "app"
+  name = "app"
 }
 
 resource "terrapod_inventory_host" "app" {
-  for_each     = data.aws_instance.app
-  workspace_id = var.workspace_id
+  for_each = data.aws_instance.app
 
   # The inventory hostname is unique per workspace, and a fleet selected by a
   # shared tag shares its `Name` tag -- so the tag cannot be the identity.
@@ -278,6 +276,15 @@ resource "terrapod_inventory_host_group" "app" {
   group_id = terrapod_inventory_group.app.id
 }
 ```
+
+**Neither resource names a workspace**, and that is not an omission. Inside a run
+Terrapod exports `TERRAPOD_WORKSPACE` from the run's own workspace — in both the
+plan and the apply phase, because the provider reads inventory in one and writes
+it in the other — so `provider "terrapod" {}` with nothing in it is enough and
+`workspace_id` defaults to the workspace the configuration belongs to. Set it
+explicitly only to point a resource at a *different* workspace, or when applying
+locally, where there is no run to export it. The provider's `workspace`
+attribute does the same job for a whole configuration.
 
 That workspace creates nothing, changes nothing, and adopts nothing into the
 configuration's management. It is ansible targeting over an existing fleet of
@@ -316,9 +323,8 @@ resource "aws_instance" "web" {
 }
 
 resource "terrapod_inventory_host" "web" {
-  for_each     = aws_instance.web
-  workspace_id = var.workspace_id
-  name         = each.key
+  for_each = aws_instance.web
+  name     = each.key
 }
 
 resource "terrapod_inventory_host_var" "web_address" {
@@ -448,11 +454,21 @@ The runner exports what the provider reads before the engine starts:
 |---|---|
 | `TERRAPOD_HOSTNAME` | The **internal** API URL the Job already holds |
 | `TERRAPOD_TOKEN` | **The run's own token.** Nothing new is minted |
+| `TERRAPOD_WORKSPACE` | **The run's own workspace.** What lets a resource omit `workspace_id` |
 
 The internal URL rather than the public one on purpose: the public hostname may
 not resolve from inside the cluster at all, and a provider pointed at it could
 end up dialling the runner pod's own loopback. `TERRAPOD_HOSTNAME` is named for a
 hostname and accepts a full URL, so a complete URL passes through untouched.
+
+`TERRAPOD_WORKSPACE` is the reason the resources above carry no `workspace_id`, and it
+is not an inventory-specific arrangement — every resource that takes a workspace id
+defaults from it, so the same empty provider block serves a variable or a run task.
+The provider's `workspace` attribute defaults from it, and each resource defaults
+its own `workspace_id` from that — so inside a run the workspace is never written
+down, which is the point. Setting it explicitly still works and still wins: that
+is how a configuration declares into a *different* workspace, which is a thing you
+may legitimately want and nothing here prevents.
 
 What makes the run's own token sufficient is a single implicit grant: **a runner
 token may manage the inventory of its own run's workspace**, and nothing else. It
@@ -467,13 +483,20 @@ phase**.
 the runner runs, so the provider needs a host and a token configured exactly as it
 does today. The implicit grant is a property of running *inside* a run.
 
-**If you set either variable yourself, Terrapod exports neither.** A workspace
-`env` variable named `TERRAPOD_HOSTNAME` or `TERRAPOD_TOKEN` is a legitimate
-thing to have, so Terrapod stands aside and logs that it has done so. The two
-decisions are taken **together**, never separately: supplying one while deferring
-to a workspace variable for the other is the arrangement that would send the
-run's real credential to a host the variable chose. So it is all-or-nothing by
-design, not by omission.
+**If you set either half of the credential pair yourself, Terrapod exports
+neither half.** A workspace `env` variable named `TERRAPOD_HOSTNAME` or
+`TERRAPOD_TOKEN` is a legitimate thing to have, so Terrapod stands aside and logs
+that it has done so. Those two decisions are taken **together**, never separately:
+supplying one while deferring to a workspace variable for the other is the
+arrangement that would send the run's real credential to a host the variable chose.
+So it is all-or-nothing by design, not by omission.
+
+**`TERRAPOD_WORKSPACE` is not part of that rule**, and is filled in on its own
+whenever you have not set it. It is neither half of a credential nor a secret — it
+is a request parameter the server authorises independently, so a wrong value is
+refused with a 403 rather than writing somewhere it should not. Tying it to the
+pair would mean a workspace that set only `TERRAPOD_WORKSPACE` received no exports
+at all.
 
 ---
 

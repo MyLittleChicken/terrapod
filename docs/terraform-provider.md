@@ -130,6 +130,26 @@ Configuration attributes (all also settable via environment variables):
 | `hostname` | `TERRAPOD_HOSTNAME` | The Terrapod instance hostname (e.g. `terrapod.example.com`). |
 | `token` | `TERRAPOD_TOKEN` | API token. Prefer `terraform login <host>` (writes `~/.terraform.d/credentials.tfrc.json`) or the env var over hard-coding it. |
 | `skip_tls_verify` | — | Skip TLS verification (local/dev only). |
+| `workspace` | `TERRAPOD_WORKSPACE` | The workspace a resource uses when its own `workspace_id` is not set. **A Terrapod run exports this from its own workspace, in both the plan and the apply phase** — so inside a run `provider "terrapod" {}` needs nothing and no resource needs a workspace id. Supply it for a local apply, where there is no run to export it. |
+
+The default applies to **every** resource and data source that takes a workspace id —
+`terrapod_variable`, `terrapod_run_task`, `terrapod_notification_configuration`,
+`terrapod_run_trigger`, the three workspace joins, the four inventory resources that
+carry a workspace id (`terrapod_inventory_settings`, `_host`, `_group`,
+`_global_var` — the other four are parented on a host or a group, not a workspace)
+and the workspace-scoped data sources. A value you set always wins, which is how a
+configuration declares into a *different* workspace from the one its run belongs to.
+
+Attributes that name a **role** in a relationship between two workspaces stay
+required, because neither end is "this resource's workspace":
+`terrapod_run_trigger.source_workspace_id` (defaulting it to the run's own would
+declare a workspace that triggers itself), and `terrapod_remote_state_consumer`'s
+`producer_workspace_id` / `consumer_workspace_id` — that resource *is* the grant, so
+a guess would be wrong in a direction that matters: defaulting the producer when you
+meant the consumer grants read of your state rather than requesting read of theirs.
+
+With no workspace from any source — no attribute, no provider `workspace`, no env var
+— a plan fails naming all three, rather than applying an empty id against the server.
 
 ### 2. Declare Terrapod objects
 
