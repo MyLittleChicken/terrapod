@@ -98,6 +98,39 @@ logger = get_logger(__name__)
 # here because there's nothing left running.
 _CANCELABLE_STATES = frozenset({"pending", "queued", "planning", "confirmed", "applying"})
 
+# The (from, to) status pairs a LISTENER is allowed to report on
+# `PATCH /listeners/{id}/runs/{run_id}`. Anything else is refused with 403.
+#
+# The listener's job is to launch a Job and say what became of it, so the only
+# transitions it has first-hand knowledge of are the ones out of a phase it
+# claimed. `run_service.VALID_TRANSITIONS` is the state machine and is much
+# wider than that on purpose -- it also describes the transitions a USER drives
+# through the guarded routes. Accepting the whole of it here let a listener
+# drive `planned -> confirmed`, which is the confirm, and so skipped the apply
+# capability check, the human confirmation, the #646/#647 staleness and
+# plan-expiry guards and the mergeability gate -- letting anyone holding a
+# listener certificate apply its own pool's planned runs unreviewed.
+#
+# Keyed on the PAIR, not the target: `confirmed` is the bypass when it comes
+# from `planned` and the legitimate apply-phase unclaim when it comes from
+# `applying`. A target-only rule would either reopen the bypass or break the
+# unclaim.
+_LISTENER_REPORTABLE: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("planning", "planned"),
+        ("planning", "errored"),
+        ("planning", "queued"),  # the plan-phase unclaim
+        ("applying", "applied"),
+        ("applying", "errored"),
+        ("applying", "confirmed"),  # the apply-phase unclaim, NOT the bypass
+        # The `canceling` outcomes. A user asked for the cancel; the listener
+        # reports which terminal the Job actually reached.
+        ("canceling", "canceled"),
+        ("canceling", "applied"),
+        ("canceling", "errored"),
+    }
+)
+
 
 def _rfc3339(dt) -> str:
     if dt is None:
@@ -356,6 +389,31 @@ async def _get_run(run_id: str, db: AsyncSession) -> Run:
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
     return run
+
+
+def _require_pool_owns_run(identity: ListenerIdentity, run: Run) -> None:
+    """Refuse a listener report about a run outside the listener's own pool.
+
+    THE BOUNDARY HERE IS THE POOL, NOT THE OWNING LISTENER -- do NOT "correct"
+    this to the `run.listener_id != l_uuid` check the claim/launch/status-PATCH
+    endpoints carry. Those endpoints are driven by the listener that claimed
+    the run, so the owning listener is the right subject there. These two are
+    not: `run_reconciler._reconcile_one` publishes `check_job_status` and
+    `stream_logs` with `publish_listener_event(str(run.pool_id), ...)`, i.e. to
+    the POOL's channel, so EVERY listener in the owning pool receives the
+    request and any of them may answer it. Which one answers first is a race,
+    and listeners are deliberately stateless and interchangeable within a pool
+    (AGENTS.md principle 5) -- so keying on the owning listener would 403 a
+    sibling answering a request it was legitimately sent.
+
+    A run with no pool was never published to any listener channel, so a report
+    about one is unsolicited and refused too.
+    """
+    if run.pool_id is None or identity.pool_id != run.pool_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Listener does not belong to the agent pool this run is assigned to",
+        )
 
 
 async def _get_workspace(workspace_id: str, db: AsyncSession) -> Workspace:
@@ -2308,6 +2366,16 @@ async def update_run_status(
     if not target_status:
         raise HTTPException(status_code=422, detail="status is required")
 
+    # A listener may only report the outcomes of a phase it claimed (see
+    # _LISTENER_REPORTABLE). An identical re-report is always allowed through:
+    # the listener retries this PATCH on timeout/5xx, so the second attempt can
+    # legitimately arrive after the first already committed the transition.
+    if target_status != run.status and (run.status, target_status) not in _LISTENER_REPORTABLE:
+        raise HTTPException(
+            status_code=403,
+            detail=f"A listener may not report {run.status!r} -> {target_status!r}",
+        )
+
     # Listener is reporting a pre-launch failure if it's transitioning a run
     # from planning/applying → errored while job_name is still NULL (no Job
     # was ever created). Surface that in metrics so we can alert on bursts of
@@ -2362,7 +2430,7 @@ async def create_runner_token(
     listener_id: str = Path(...),
     run_id: str = Path(...),
     body: dict = Body(default={}),
-    listener: object = Depends(get_listener_identity),
+    identity: ListenerIdentity = Depends(get_listener_identity),
     db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """Generate a short-lived runner token for a run.
@@ -2375,8 +2443,22 @@ async def create_runner_token(
 
     run = await _get_run(run_id, db)
 
-    # Verify this listener owns the run
+    # Verify the CALLER's cert matches the path, THEN that this listener owns
+    # the run. Both checks are required: the path segment is chosen by the
+    # caller, so without the first one a valid certificate from ANY pool could
+    # name the owning listener in the path and mint a runner token for a run it
+    # has nothing to do with.
+    #
+    # The ORDER is load-bearing. Checking the run first would answer "Run not
+    # assigned to this listener" to a caller holding no certificate for that
+    # listener -- confirming whether that listener owns that run to someone who
+    # should not have got that far.
     l_uuid = parse_id(listener_id, "listener-", detail="Listener not found")
+    if identity.listener_id != l_uuid:
+        raise HTTPException(
+            status_code=403,
+            detail="Certificate does not match the listener id in the path",
+        )
     if run.listener_id != l_uuid:
         raise HTTPException(status_code=403, detail="Run not assigned to this listener")
 
@@ -2459,6 +2541,7 @@ async def report_job_status(
             detail="Certificate does not match the listener id in the path",
         )
     run = await _get_run(run_id, db)
+    _require_pool_owns_run(identity, run)
 
     job_status = body.get("status", "")
     if not job_status:
@@ -2541,6 +2624,7 @@ async def upload_log_stream(
             detail="Certificate does not match the listener id in the path",
         )
     run = await _get_run(run_id, db)
+    _require_pool_owns_run(identity, run)
     if phase not in ("plan", "apply"):
         phase = "plan" if run.status == "planning" else "apply"
     body_bytes = await request.body()
