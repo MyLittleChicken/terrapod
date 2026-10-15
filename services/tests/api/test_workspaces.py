@@ -73,9 +73,12 @@ def _mock_workspace(
     # The Ansible roots and run defaults (#1929). Set explicitly because
     # `_workspace_json` serialises them, and an auto-MagicMock attribute reaches
     # `json.dumps` and dies with a message that names neither the attribute nor
-    # this fixture. `config_directory` is None, which is the real default: no
-    # configure operation.
-    ws.config_directory = None
+    # this fixture. `config_directory` is `""`, the real default: the
+    # configuration version's root. Whether there IS a configure operation is
+    # `configure_enabled` (#1966), which defaults False.
+    ws.plan_apply_enabled = True
+    ws.configure_enabled = False
+    ws.config_directory = ""
     ws.inventory_paths = []
     ws.default_playbook = ""
     ws.default_limit = ""
@@ -2724,8 +2727,11 @@ class TestTheConfigureAttributesOnTheWorkspaceRoutes:
 
         assert resp.status_code == 201, resp.text
         ws = next(w for w in added if getattr(w, "name", None) == "plain-ws")
-        assert ws.config_directory is None
+        assert ws.config_directory == ""
         assert ws.inventory_include_platform is True
+        # The declaration's defaults are the compatibility story (#1966).
+        assert ws.plan_apply_enabled is True
+        assert ws.configure_enabled is False
 
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
@@ -2750,7 +2756,7 @@ class TestTheConfigureAttributesOnTheWorkspaceRoutes:
 
         assert resp.status_code == 201, resp.text
         ws = next(w for w in added if getattr(w, "name", None) == "root-ws")
-        assert ws.config_directory == "", "an explicit empty root became None"
+        assert ws.config_directory == "", "an explicit empty root was not stored"
 
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
@@ -2788,15 +2794,21 @@ class TestTheConfigureAttributesOnTheWorkspaceRoutes:
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
     @patch("terrapod.api.routers.tfe_v2.resolve_workspace_capabilities_for")
-    async def test_a_null_config_directory_reads_back_as_null_not_empty(self, mock_resolve, *mocks):
-        """The distinction has to survive the wire, not just the column.
+    async def test_config_directory_has_no_null_state_on_the_wire(self, mock_resolve, *mocks):
+        """`config-directory` is a path, and a path is never null (#1966).
 
-        Serialising NULL as `""` would tell every client that every workspace
-        has a configure operation rooted at the repository top.
+        It used to serialise `None` to mean "no configure operation". That made
+        one field answer two questions; the question is now
+        `configure-enabled`, and a workspace that has not declared a configure
+        operation still has an ordinary `config-directory` of `""` — the
+        configuration version's root, which is where it would run if it were
+        enabled. A client writing a read straight back therefore cannot change
+        anything, which is the property the three-state shape was protecting
+        and gets more cheaply this way.
         """
         mock_resolve.return_value = caps_for_level("read")
         ws = _mock_workspace(name="plain-ws")
-        ws.config_directory = None
+        ws.config_directory = ""
         app, mock_db = _make_app(_user(roles=["admin"]))
         ws_result = MagicMock()
         ws_result.scalar_one_or_none.return_value = ws
@@ -2808,7 +2820,10 @@ class TestTheConfigureAttributesOnTheWorkspaceRoutes:
             resp = await c.get(f"/api/v1/workspaces/ws-{ws.id}", headers=_AUTH)
 
         assert resp.status_code == 200, resp.text
-        assert resp.json()["data"]["attributes"]["config-directory"] is None
+        attrs = resp.json()["data"]["attributes"]
+        assert attrs["config-directory"] == ""
+        assert attrs["configure-enabled"] is False
+        assert attrs["plan-apply-enabled"] is True
 
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
@@ -2846,7 +2861,7 @@ class TestTheConfigureAttributesOnTheWorkspaceRoutes:
     @patch("terrapod.api.app.init_db")
     @patch("terrapod.redis.client.publish_workspace_event", new_callable=AsyncMock)
     @patch("terrapod.api.routers.tfe_v2.resolve_workspace_capabilities_for")
-    async def test_patch_sets_them_and_an_explicit_null_clears_the_root(
+    async def test_patch_sets_one_root_and_leaves_the_others_alone(
         self, mock_resolve, _mock_publish, *mocks
     ):
         mock_resolve.return_value = caps_for_level("admin")
@@ -2868,14 +2883,19 @@ class TestTheConfigureAttributesOnTheWorkspaceRoutes:
         assert ws.default_playbook == "deploy.yml"
         assert ws.config_directory == "ansible", "an untouched attribute was rewritten"
 
+        # A null is now a type error rather than a clear (#1966): the field is
+        # a path and there is nothing to clear it to. Refused with a 422 naming
+        # the field, not silently coerced to `""` — a server that rewrote a
+        # submitted value would make a provider's plan disagree with its result.
         async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
             resp = await c.patch(
                 f"/api/v1/workspaces/ws-{ws.id}",
                 json={"data": {"attributes": {"config-directory": None}}},
                 headers=_AUTH,
             )
-        assert resp.status_code == 200, resp.text
-        assert ws.config_directory is None, "an explicit null did not clear the root"
+        assert resp.status_code == 422, resp.text
+        assert "config-directory" in resp.json()["detail"]
+        assert ws.config_directory == "ansible", "a refused PATCH still mutated the row"
 
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
@@ -2926,3 +2946,188 @@ class TestTheConfigureAttributesOnTheWorkspaceRoutes:
             )
 
         assert resp.status_code == 422, f"{because}: got {resp.status_code} {resp.text[:200]}"
+
+
+class TestAWorkspaceMustHaveAtLeastOneOperation:
+    """The one state two independent booleans permit and nobody wants (#1966).
+
+    An enum could not express it, which is the trade that came with choosing
+    booleans -- so the refusal is the price of the shape, not an afterthought.
+    It is refused rather than stored because a workspace that can do nothing
+    would push a "nothing to do" branch into the dispatcher, the reconciler,
+    autodiscovery materialisation and every UI surface, to represent a state
+    whose only honest meaning is "I did not mean to do that". `locked` already
+    expresses "park this workspace", reversibly.
+
+    Driven through the ROUTE in every case, never by calling the validator.
+    That is the distinction that matters here: `validate_operations` has its own
+    unit tests, and they all pass with the call site deleted -- which is exactly
+    how a 422 guard ships as a 500. The mutation to run against this class is
+    removing the `_422(workspace_settings.validate_operations, ...)` call from
+    `create_workspace` or from the PATCH handler.
+    """
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.redis.client.publish_workspace_event", new_callable=AsyncMock)
+    async def test_create_refuses_both_false(self, _mock_publish, *mocks):
+        app, mock_db = _make_app(_user(roles=["admin"]))
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None
+        mock_db.execute.return_value = mock_result
+        mock_db.refresh = AsyncMock()
+        added: list = []
+        mock_db.add = added.append
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.post(
+                "/api/v1/workspaces",
+                json={
+                    "data": {
+                        "attributes": {
+                            "name": "inert-ws",
+                            "plan-apply-enabled": False,
+                            "configure-enabled": False,
+                        }
+                    }
+                },
+                headers=_AUTH,
+            )
+
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert "plan-apply-enabled" in detail and "configure-enabled" in detail, (
+            f"the refusal must name both fields so the caller knows which to set: {detail}"
+        )
+        assert not added, "a refused create still added a row"
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.redis.client.publish_workspace_event", new_callable=AsyncMock)
+    async def test_create_accepts_configure_only(self, _mock_publish, *mocks):
+        """Configure-only is a first-class workspace, not a degenerate one.
+
+        The whole point of two booleans rather than "configure is a thing you
+        add to a plan/apply workspace": the work Ansible owns -- day-2
+        patching, cert rotation, ordered restarts -- often has no apply at all.
+        """
+        app, mock_db = _make_app(_user(roles=["admin"]))
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None
+        mock_db.execute.return_value = mock_result
+        mock_db.refresh = AsyncMock()
+        added: list = []
+        mock_db.add = added.append
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.post(
+                "/api/v1/workspaces",
+                json={
+                    "data": {
+                        "attributes": {
+                            "name": "configure-only",
+                            "plan-apply-enabled": False,
+                            "configure-enabled": True,
+                            "config-directory": "ansible",
+                        }
+                    }
+                },
+                headers=_AUTH,
+            )
+
+        assert resp.status_code == 201, resp.text
+        ws = next(w for w in added if getattr(w, "name", None) == "configure-only")
+        assert ws.plan_apply_enabled is False
+        assert ws.configure_enabled is True
+        assert ws.config_directory == "ansible"
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.redis.client.publish_workspace_event", new_callable=AsyncMock)
+    @patch("terrapod.api.routers.tfe_v2.resolve_workspace_capabilities_for")
+    async def test_patch_judges_the_merge_not_the_payload(
+        self, mock_resolve, _mock_publish, *mocks
+    ):
+        """The property that cannot be checked from the request body alone.
+
+        Sending `plan-apply-enabled: false` ALONE is legitimate on a workspace
+        that already has configure on, and fatal on one that does not. Both
+        requests are byte-identical, so a check over `attrs` would have to
+        accept both -- which is the shape of the #316 trap seen from the other
+        side.
+        """
+        mock_resolve.return_value = caps_for_level("admin")
+
+        # (a) the workspace already has configure on -> turning plan/apply off is fine.
+        ws = _mock_workspace(name="has-configure")
+        ws.plan_apply_enabled = True
+        ws.configure_enabled = True
+        app, mock_db = _make_app(_user(roles=["admin"]))
+        ws_result = MagicMock()
+        ws_result.scalar_one_or_none.return_value = ws
+        mock_db.execute.return_value = ws_result
+        mock_db.refresh = AsyncMock()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.patch(
+                f"/api/v1/workspaces/ws-{ws.id}",
+                json={"data": {"attributes": {"plan-apply-enabled": False}}},
+                headers=_AUTH,
+            )
+        assert resp.status_code == 200, resp.text
+        assert ws.plan_apply_enabled is False
+
+        # (b) the identical request on a plan/apply-only workspace -> 422.
+        ws2 = _mock_workspace(name="plan-only")
+        ws2.plan_apply_enabled = True
+        ws2.configure_enabled = False
+        app2, mock_db2 = _make_app(_user(roles=["admin"]))
+        ws2_result = MagicMock()
+        ws2_result.scalar_one_or_none.return_value = ws2
+        mock_db2.execute.return_value = ws2_result
+        mock_db2.refresh = AsyncMock()
+
+        async with AsyncClient(transport=ASGITransport(app=app2), base_url=_BASE) as c:
+            resp = await c.patch(
+                f"/api/v1/workspaces/ws-{ws2.id}",
+                json={"data": {"attributes": {"plan-apply-enabled": False}}},
+                headers=_AUTH,
+            )
+        assert resp.status_code == 422, (
+            "the same payload that is legitimate on a configure-capable workspace "
+            "must be refused on one that would be left inert"
+        )
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.redis.client.publish_workspace_event", new_callable=AsyncMock)
+    @patch("terrapod.api.routers.tfe_v2.resolve_workspace_capabilities_for")
+    async def test_a_stringified_boolean_is_refused_not_coerced(
+        self, mock_resolve, _mock_publish, *mocks
+    ):
+        """`bool("false")` is True (#1301), so a JSON string must not sail through.
+
+        Worth its own test on these two specifically: a caller who typed
+        `"false"` for `plan-apply-enabled` and got the opposite would have
+        plan/apply left ON while believing they had turned it off.
+        """
+        mock_resolve.return_value = caps_for_level("admin")
+        ws = _mock_workspace(name="cfg-ws")
+        app, mock_db = _make_app(_user(roles=["admin"]))
+        ws_result = MagicMock()
+        ws_result.scalar_one_or_none.return_value = ws
+        mock_db.execute.return_value = ws_result
+        mock_db.refresh = AsyncMock()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.patch(
+                f"/api/v1/workspaces/ws-{ws.id}",
+                json={"data": {"attributes": {"configure-enabled": "false"}}},
+                headers=_AUTH,
+            )
+        assert resp.status_code == 422, resp.text
+        assert "configure-enabled" in resp.json()["detail"]
